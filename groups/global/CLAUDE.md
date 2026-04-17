@@ -36,7 +36,19 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 
 ## Your Workspace
 
-Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
+Your writable workspace is `/workspace/group/`. Files written here persist across container restarts.
+
+**Important:** Do NOT write to `/workspace/{folder-name}/` directly — that path is not mounted. Use the correct path below.
+
+### Main group (this group)
+Write to `/workspace/group/` for your own files.
+
+To write files **for another group**, use `/workspace/groups/{folder}/`:
+- onto group → `/workspace/groups/onto_workspace/`
+- skytower group → `/workspace/groups/skytower_workspace/`
+
+### Other groups
+Write only to `/workspace/group/`. Do not use any other path.
 
 ## Memory
 
@@ -76,6 +88,29 @@ No `##` headings. No `[links](url)`. No `**double stars**`.
 Standard Markdown works: `**bold**`, `*italic*`, `[links](url)`, `# headings`.
 
 ---
+
+## 대화방 ID / JID 안내
+
+사용자가 "대화 ID 알려줘", "JID 알려줘", "conversation ID", "채팅 ID" 등을 물어보면 환경변수를 읽어 알려줘:
+
+```bash
+echo "JID: $NANOCLAW_CHAT_JID"
+```
+
+응답 형식:
+- JID: `relay:ePm9vhUooJx9:c5` → 대화방 ID는 **5** (그룹 등록 시 이 JID를 사용)
+- JID가 없으면: "JID 정보를 확인할 수 없습니다."
+
+---
+
+## Group Registration
+
+When registering a new group via `mcp__nanoclaw__register_group`, use the group name (not the assistant name) as the trigger:
+
+- Group named "onto" → trigger `@onto`
+- Group named "web" → trigger `@web`
+
+After registering, confirm with the **actual trigger value you used**, not `@Andy` or `@$NANOCLAW_ASSISTANT_NAME`.
 
 ## Task Scripts
 

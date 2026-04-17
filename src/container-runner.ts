@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -34,12 +35,16 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const THINKING_START_MARKER = '---NANOCLAW_THINKING_START---';
+const THINKING_END_MARKER = '---NANOCLAW_THINKING_END---';
 
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
   groupFolder: string;
-  /** Optional override for the IPC/session sub-folder (e.g. per-conversation isolation). */
+  /** Folder used for IPC and session dirs. Defaults to groupFolder.
+   *  Set to a conversation-specific name (e.g. vanilla_main__c3) for relay
+   *  conversations so each conversation gets an isolated IPC+session space. */
   ipcFolder?: string;
   chatJid: string;
   isMain: boolean;
@@ -53,6 +58,8 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  /** Accumulated thinking/reasoning text from the agent (relay channel only) */
+  thinking?: string;
 }
 
 interface VolumeMount {
@@ -66,6 +73,8 @@ function buildVolumeMounts(
   isMain: boolean,
   ipcFolder?: string,
 ): VolumeMount[] {
+  // ipcFolder overrides group.folder for session + IPC paths (used for relay conversations)
+  const effectiveIpcFolder = ipcFolder ?? group.folder;
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
@@ -109,20 +118,26 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory — writable for main so it can update shared context
-    const globalDir = path.join(GROUPS_DIR, 'global');
-    if (fs.existsSync(globalDir)) {
-      mounts.push({
-        hostPath: globalDir,
-        containerPath: '/workspace/global',
-        readonly: false,
-      });
-    }
+    // Main can write to all other groups' folders via /workspace/groups/{folder}/.
+    // This lets the main agent manage other groups' workspaces (e.g. git clone for a group).
+    mounts.push({
+      hostPath: GROUPS_DIR,
+      containerPath: '/workspace/groups',
+      readonly: false,
+    });
   } else {
     // Other groups only get their own folder
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
+      readonly: false,
+    });
+
+    // Also mount at /workspace/{folder} so agents that infer the path
+    // from the folder name still write to the correct host location.
+    mounts.push({
+      hostPath: groupDir,
+      containerPath: `/workspace/${group.folder}`,
       readonly: false,
     });
 
@@ -139,11 +154,13 @@ function buildVolumeMounts(
   }
 
   // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
+  // Each group gets their own .claude/ to prevent cross-group session access.
+  // For relay conversations, effectiveIpcFolder is conversation-specific (e.g. vanilla_main__c3)
+  // so each conversation gets its own isolated session and IPC namespace.
   const groupSessionsDir = path.join(
     DATA_DIR,
     'sessions',
-    group.folder,
+    effectiveIpcFolder,
     '.claude',
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
@@ -189,8 +206,9 @@ function buildVolumeMounts(
   });
 
   // Per-group IPC namespace: each group gets its own IPC directory
-  // This prevents cross-group privilege escalation via IPC
-  const groupIpcDir = resolveGroupIpcPath(ipcFolder ?? group.folder);
+  // This prevents cross-group privilege escalation via IPC.
+  // For relay conversations, effectiveIpcFolder is conversation-specific.
+  const groupIpcDir = resolveGroupIpcPath(effectiveIpcFolder);
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
@@ -212,19 +230,23 @@ function buildVolumeMounts(
   const groupAgentRunnerDir = path.join(
     DATA_DIR,
     'sessions',
-    group.folder,
+    effectiveIpcFolder,
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    // Always sync core source files so updates propagate without manual intervention.
+    // The agent may add custom files; we only overwrite files that exist in the source.
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+    for (const file of fs.readdirSync(agentRunnerSrc)) {
+      const src = path.join(agentRunnerSrc, file);
+      const dst = path.join(groupAgentRunnerDir, file);
+      if (fs.statSync(src).isFile()) {
+        const srcMtime = fs.statSync(src).mtimeMs;
+        const dstMtime = fs.existsSync(dst) ? fs.statSync(dst).mtimeMs : 0;
+        if (srcMtime > dstMtime) {
+          fs.copyFileSync(src, dst);
+        }
+      }
     }
   }
   mounts.push({
@@ -232,6 +254,19 @@ function buildVolumeMounts(
     containerPath: '/app/src',
     readonly: false,
   });
+
+  // Mount host Claude OAuth credentials so containers use the Pro subscription
+  // without needing a separate API key. Read-only to prevent containers from
+  // modifying or leaking the token.
+  const homeDir = process.env.HOME || os.homedir();
+  const hostCredentials = path.join(homeDir, '.claude', '.credentials.json');
+  if (fs.existsSync(hostCredentials)) {
+    mounts.push({
+      hostPath: hostCredentials,
+      containerPath: '/home/node/.claude/.credentials.json',
+      readonly: true,
+    });
+  }
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
@@ -250,25 +285,48 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
+  assistantName?: string,
+  chatJid?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
-  } else {
-    logger.warn(
+  // Pass assistant name so agents can use the correct trigger when registering groups
+  args.push('-e', `NANOCLAW_ASSISTANT_NAME=${assistantName ?? 'Andy'}`);
+
+  // Pass chat JID so agents can report their own JID/conversation ID when asked
+  if (chatJid) {
+    args.push('-e', `NANOCLAW_CHAT_JID=${chatJid}`);
+  }
+
+  // Skip OneCLI when OAuth credentials are present.
+  // OneCLI's proxy injects x-api-key which conflicts with OAuth's Authorization header,
+  // causing Anthropic to use the injected (no-credit) API key over the valid OAuth token.
+  const homeDir = process.env.HOME || os.homedir();
+  const hostCredentials = path.join(homeDir, '.claude', '.credentials.json');
+  const useOAuth = fs.existsSync(hostCredentials);
+
+  if (useOAuth) {
+    logger.info(
       { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
+      'OAuth credentials present — skipping OneCLI proxy',
     );
+  } else {
+    // OneCLI gateway handles credential injection via HTTPS proxy.
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false,
+      agent: agentIdentifier,
+    });
+    if (onecliApplied) {
+      logger.info({ containerName }, 'OneCLI gateway config applied');
+    } else {
+      logger.warn(
+        { containerName },
+        'OneCLI gateway not reachable — container will have no credentials',
+      );
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -320,6 +378,8 @@ export async function runContainerAgent(
     mounts,
     containerName,
     agentIdentifier,
+    input.assistantName,
+    input.chatJid,
   );
 
   logger.debug(
@@ -386,35 +446,66 @@ export async function runContainerAgent(
         }
       }
 
-      // Stream-parse for output markers
-      if (onOutput) {
+      // Stream-parse for output and thinking markers
+      if (onOutput || onThinkingChunk) {
         parseBuffer += chunk;
-        let startIdx: number;
-        while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
-          const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-          if (endIdx === -1) break; // Incomplete pair, wait for more data
 
-          const jsonStr = parseBuffer
-            .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-            .trim();
-          parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
-
-          try {
-            const parsed: ContainerOutput = JSON.parse(jsonStr);
-            if (parsed.newSessionId) {
-              newSessionId = parsed.newSessionId;
-            }
-            hadStreamingOutput = true;
-            // Activity detected — reset the hard timeout
-            resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
-          } catch (err) {
-            logger.warn(
-              { group: group.name, error: err },
-              'Failed to parse streamed output chunk',
+        // Parse THINKING_START/END marker pairs for real-time thinking streaming
+        if (onThinkingChunk) {
+          let thinkingStart: number;
+          while (
+            (thinkingStart = parseBuffer.indexOf(THINKING_START_MARKER)) !== -1
+          ) {
+            const thinkingEnd = parseBuffer.indexOf(
+              THINKING_END_MARKER,
+              thinkingStart,
             );
+            if (thinkingEnd === -1) break; // Incomplete pair, wait for more data
+
+            const jsonStr = parseBuffer
+              .slice(thinkingStart + THINKING_START_MARKER.length, thinkingEnd)
+              .trim();
+            parseBuffer = parseBuffer.slice(
+              thinkingEnd + THINKING_END_MARKER.length,
+            );
+
+            try {
+              const { text } = JSON.parse(jsonStr) as { text: string };
+              if (text) onThinkingChunk(text);
+            } catch {
+              // ignore malformed thinking chunks
+            }
+          }
+        }
+
+        if (onOutput) {
+          let startIdx: number;
+          while ((startIdx = parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1) {
+            const endIdx = parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
+            if (endIdx === -1) break; // Incomplete pair, wait for more data
+
+            const jsonStr = parseBuffer
+              .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
+              .trim();
+            parseBuffer = parseBuffer.slice(endIdx + OUTPUT_END_MARKER.length);
+
+            try {
+              const parsed: ContainerOutput = JSON.parse(jsonStr);
+              if (parsed.newSessionId) {
+                newSessionId = parsed.newSessionId;
+              }
+              hadStreamingOutput = true;
+              // Activity detected — reset the hard timeout
+              resetTimeout();
+              // Call onOutput for all markers (including null results)
+              // so idle timers start even for "silent" query completions.
+              outputChain = outputChain.then(() => onOutput(parsed));
+            } catch (err) {
+              logger.warn(
+                { group: group.name, error: err },
+                'Failed to parse streamed output chunk',
+              );
+            }
           }
         }
       }
@@ -424,7 +515,12 @@ export async function runContainerAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (line) logger.debug({ container: group.folder }, line);
+        if (!line) continue;
+        if (line.includes('[OLLAMA]')) {
+          logger.info({ container: group.folder }, line);
+        } else {
+          logger.debug({ container: group.folder }, line);
+        }
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).
@@ -695,7 +791,7 @@ export async function runContainerAgent(
 }
 
 /**
- * Start the legacy relay-plugin container (one per main group, long-running).
+ * Start a persistent relay container that connects to the relay server.
  * Unlike runContainerAgent (one-shot stdin mode), this container runs
  * indefinitely and processes messages via Socket.io.
  *
@@ -715,10 +811,14 @@ export async function startRelayContainer(
   const containerName = `nanoclaw-relay-${Date.now()}`;
   const args = await buildContainerArgs(mounts, containerName);
 
+  // Inject relay env vars before the image name (last element)
   const relayArgs: string[] = [
-    '-e', `RELAY_URL=${relayConfig.relayUrl}`,
-    '-e', `AGENT_ID=${relayConfig.agentId}`,
-    '-e', `AGENT_TOKEN=${relayConfig.agentToken}`,
+    '-e',
+    `RELAY_URL=${relayConfig.relayUrl}`,
+    '-e',
+    `AGENT_ID=${relayConfig.agentId}`,
+    '-e',
+    `AGENT_TOKEN=${relayConfig.agentToken}`,
   ];
   if (relayConfig.agentName) {
     relayArgs.push('-e', `AGENT_NAME=${relayConfig.agentName}`);
@@ -726,7 +826,11 @@ export async function startRelayContainer(
   args.splice(args.length - 1, 0, ...relayArgs);
 
   logger.info(
-    { relayUrl: relayConfig.relayUrl, agentId: relayConfig.agentId, containerName },
+    {
+      relayUrl: relayConfig.relayUrl,
+      agentId: relayConfig.agentId,
+      containerName,
+    },
     'Starting relay container',
   );
 
@@ -750,7 +854,7 @@ export async function startRelayContainer(
     onExit(code);
   });
 
-  container.on('error', (err: Error) => {
+  container.on('error', (err) => {
     logger.error({ err, containerName }, 'Relay container spawn error');
     onExit(-1);
   });

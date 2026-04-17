@@ -23,24 +23,7 @@ import {
   PreCompactHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
-
-interface ContainerInput {
-  prompt: string;
-  sessionId?: string;
-  groupFolder: string;
-  chatJid: string;
-  isMain: boolean;
-  isScheduledTask?: boolean;
-  assistantName?: string;
-  script?: string;
-}
-
-interface ContainerOutput {
-  status: 'success' | 'error';
-  result: string | null;
-  newSessionId?: string;
-  error?: string;
-}
+import { startRelayPlugin, ContainerInput, ContainerOutput } from './relay-plugin.js';
 
 interface SessionEntry {
   sessionId: string;
@@ -60,7 +43,16 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+// Relay Plugin 모드에서 writeOutput() 결과를 socket으로 전달하는 핸들러
+let onOutput: ((output: ContainerOutput) => void) | undefined;
+let onThinking: ((text: string) => void) | undefined;
+let onChunk: ((text: string) => void) | undefined;
+let relayWaitForRestart: (() => Promise<ContainerInput>) | undefined;
+
+// Relay mode uses a separate input dir so Telegram one-shot containers
+// can't steal relay follow-up messages from the shared IPC directory.
+const isRelayMode = !!(process.env.RELAY_URL && (process.env.AGENT_TOKEN || process.env.AGENT_ID === undefined));
+const IPC_INPUT_DIR = isRelayMode ? '/workspace/ipc/relay-input' : '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
 
@@ -116,11 +108,21 @@ async function readStdin(): Promise<string> {
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const THINKING_START_MARKER = '---NANOCLAW_THINKING_START---';
+const THINKING_END_MARKER = '---NANOCLAW_THINKING_END---';
 
 function writeOutput(output: ContainerOutput): void {
+  onOutput?.(output);
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+/** stdin 모드에서 thinking 청크를 nanoclaw로 즉시 스트리밍 */
+function writeThinkingChunk(text: string): void {
+  console.log(THINKING_START_MARKER);
+  console.log(JSON.stringify({ text }));
+  console.log(THINKING_END_MARKER);
 }
 
 function log(message: string): void {
@@ -411,6 +413,7 @@ async function runQuery(
   let lastAssistantUuid: string | undefined;
   let messageCount = 0;
   let resultCount = 0;
+  let accumulatedThinking = '';
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
@@ -469,6 +472,7 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        'mcp__ollama__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -483,6 +487,10 @@ async function runQuery(
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
+        },
+        ollama: {
+          command: 'node',
+          args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
         },
       },
       hooks: {
@@ -499,8 +507,26 @@ async function runQuery(
         : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+    if (message.type === 'assistant') {
+      if ('uuid' in message) {
+        lastAssistantUuid = (message as { uuid: string }).uuid;
+      }
+      // thinking/텍스트 청크 처리
+      const assistantMsg = message as { message?: { content?: Array<{ type: string; thinking?: string; text?: string }> } };
+      for (const block of assistantMsg.message?.content ?? []) {
+        if (block.type === 'thinking' && block.thinking) {
+          if (isRelayMode) {
+            // relay-plugin 모드: socket으로 직접 전송
+            onThinking?.(block.thinking);
+          } else {
+            // stdin 모드: stdout 마커로 nanoclaw에 즉시 스트리밍
+            writeThinkingChunk(block.thinking);
+          }
+          accumulatedThinking += block.thinking;
+        } else if (block.type === 'text' && block.text) {
+          onChunk?.(block.text);
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -529,10 +555,13 @@ async function runQuery(
       log(
         `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
       );
+      const thinkingToEmit = accumulatedThinking || undefined;
+      accumulatedThinking = '';
       writeOutput({
         status: 'success',
         result: textResult || null,
         newSessionId,
+        thinking: thinkingToEmit,
       });
     }
   }
@@ -604,14 +633,29 @@ async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
   try {
-    const stdinData = await readStdin();
-    containerInput = JSON.parse(stdinData);
-    try {
-      fs.unlinkSync('/tmp/input.json');
-    } catch {
-      /* may not exist */
+    //   const stdinData = await readStdin();
+    //   containerInput = JSON.parse(stdinData);
+    //   // Delete the temp file the entrypoint wrote — it contains secrets
+    //   try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+    //   log(`Received input for group: ${containerInput.groupFolder}`);
+    const isRelayMode = !!(process.env.RELAY_URL && (process.env.AGENT_TOKEN || process.env.AGENT_ID === undefined));
+
+    if (isRelayMode) {
+      // ── Relay Plugin 모드: 웹 UI에서 첫 메시지를 기다림 ──────────────────
+      log('Relay Plugin 모드로 시작...');
+      const { containerInput: relayInput, outputHandler } = await startRelayPlugin();
+      containerInput = relayInput;
+      onOutput = outputHandler;
+      log(`Relay 첫 메시지 수신: ${containerInput.prompt.slice(0, 80)}`);
+    } else {
+      // ── 기존 stdin 모드 (Docker 직접 실행 / 테스트 호환) ────────────────
+      const stdinData = await readStdin();
+      containerInput = JSON.parse(stdinData);
+      try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+      log(`Received input for group: ${containerInput.groupFolder}`);
     }
-    log(`Received input for group: ${containerInput.groupFolder}`);
+
+
   } catch (err) {
     writeOutput({
       status: 'error',
@@ -627,6 +671,15 @@ async function main(): Promise<void> {
     ...process.env,
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
   };
+
+  // Configure git credentials via ~/.netrc so git subprocesses can access
+  // private GitHub repositories without exposing the token in the environment.
+  const githubToken = containerInput.secrets?.GITHUB_TOKEN;
+  if (githubToken) {
+    const netrcPath = path.join(process.env.HOME || '/home/node', '.netrc');
+    const netrcEntry = `machine github.com\n  login git\n  password ${githubToken}\n`;
+    fs.writeFileSync(netrcPath, netrcEntry, { mode: 0o600 });
+  }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
@@ -697,10 +750,17 @@ async function main(): Promise<void> {
         resumeAt = queryResult.lastAssistantUuid;
       }
 
-      // If _close was consumed during the query, exit immediately.
-      // Don't emit a session-update marker (it would reset the host's
-      // idle timer and cause a 30-min delay before the next _close).
+      // If _close was consumed during the query (relay disconnected mid-query),
+      // wait for relay to reconnect and receive a new first message, then restart.
       if (queryResult.closedDuringQuery) {
+        if (relayWaitForRestart) {
+          log('Relay disconnected mid-query, waiting for reconnect...');
+          const newInput = await relayWaitForRestart();
+          prompt = newInput.prompt;
+          sessionId = undefined;
+          resumeAt = undefined;
+          continue;
+        }
         log('Close sentinel consumed during query, exiting');
         break;
       }
@@ -713,6 +773,14 @@ async function main(): Promise<void> {
       // Wait for the next message or _close sentinel
       const nextMessage = await waitForIpcMessage();
       if (nextMessage === null) {
+        if (relayWaitForRestart) {
+          log('Relay disconnected between queries, waiting for reconnect...');
+          const newInput = await relayWaitForRestart();
+          prompt = newInput.prompt;
+          sessionId = undefined;
+          resumeAt = undefined;
+          continue;
+        }
         log('Close sentinel received, exiting');
         break;
       }
