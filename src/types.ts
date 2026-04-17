@@ -93,6 +93,12 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: send a thinking/reasoning chunk before the final message.
+  sendThinkingChunk?(jid: string, text: string): Promise<void>;
+  // Optional: return a suffix for a per-JID IPC sub-folder for isolation.
+  // Orchestrator appends `__<suffix>` to group.folder to create an isolated IPC path.
+  // Use when a single registered group needs per-conversation process isolation.
+  getIpcFolderSuffix?(chatJid: string): string | undefined;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }
