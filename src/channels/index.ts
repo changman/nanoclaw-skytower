@@ -8,6 +8,7 @@
 // slack
 
 // telegram
+import './telegram.js';
 
 // relay
 import './relay.js';

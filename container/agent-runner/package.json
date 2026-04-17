@@ -12,6 +12,7 @@
     "@anthropic-ai/claude-agent-sdk": "^0.2.92",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "cron-parser": "^5.0.0",
+    "socket.io-client": "^4.8.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
