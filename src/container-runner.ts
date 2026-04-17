@@ -694,6 +694,73 @@ export async function runContainerAgent(
   });
 }
 
+/**
+ * Start the legacy relay-plugin container (one per main group, long-running).
+ * Unlike runContainerAgent (one-shot stdin mode), this container runs
+ * indefinitely and processes messages via Socket.io.
+ *
+ * Returns a stop function that gracefully terminates the container.
+ */
+export async function startRelayContainer(
+  group: RegisteredGroup,
+  relayConfig: {
+    relayUrl: string;
+    agentId: string;
+    agentToken: string;
+    agentName?: string;
+  },
+  onExit: (code: number | null) => void,
+): Promise<() => void> {
+  const mounts = buildVolumeMounts(group, true);
+  const containerName = `nanoclaw-relay-${Date.now()}`;
+  const args = await buildContainerArgs(mounts, containerName);
+
+  const relayArgs: string[] = [
+    '-e', `RELAY_URL=${relayConfig.relayUrl}`,
+    '-e', `AGENT_ID=${relayConfig.agentId}`,
+    '-e', `AGENT_TOKEN=${relayConfig.agentToken}`,
+  ];
+  if (relayConfig.agentName) {
+    relayArgs.push('-e', `AGENT_NAME=${relayConfig.agentName}`);
+  }
+  args.splice(args.length - 1, 0, ...relayArgs);
+
+  logger.info(
+    { relayUrl: relayConfig.relayUrl, agentId: relayConfig.agentId, containerName },
+    'Starting relay container',
+  );
+
+  const container = spawn(CONTAINER_RUNTIME_BIN, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  container.stdout?.on('data', (data: Buffer) => {
+    const line = data.toString().trim();
+    if (line) logger.debug({ container: 'relay' }, line);
+  });
+
+  container.stderr?.on('data', (data: Buffer) => {
+    for (const line of data.toString().trim().split('\n')) {
+      if (line) logger.debug({ container: 'relay' }, line);
+    }
+  });
+
+  container.on('close', (code) => {
+    logger.info({ containerName, code }, 'Relay container exited');
+    onExit(code);
+  });
+
+  container.on('error', (err: Error) => {
+    logger.error({ err, containerName }, 'Relay container spawn error');
+    onExit(-1);
+  });
+
+  return () => {
+    stopContainer(containerName);
+    container.kill();
+  };
+}
+
 export function writeTasksSnapshot(
   groupFolder: string,
   isMain: boolean,
