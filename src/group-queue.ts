@@ -24,6 +24,7 @@ interface GroupState {
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
+  ipcFolder: string | null;
   retryCount: number;
 }
 
@@ -48,6 +49,7 @@ export class GroupQueue {
         process: null,
         containerName: null,
         groupFolder: null,
+        ipcFolder: null,
         retryCount: 0,
       };
       this.groups.set(groupJid, state);
@@ -134,11 +136,13 @@ export class GroupQueue {
     proc: ChildProcess,
     containerName: string,
     groupFolder?: string,
+    ipcFolder?: string,
   ): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+    if (ipcFolder) state.ipcFolder = ipcFolder;
   }
 
   /**
@@ -163,7 +167,8 @@ export class GroupQueue {
       return false;
     state.idleWaiting = false; // Agent is about to receive work, no longer idle
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const ipcDir = state.ipcFolder ?? state.groupFolder;
+    const inputDir = path.join(DATA_DIR, 'ipc', ipcDir, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}.json`;
@@ -184,7 +189,8 @@ export class GroupQueue {
     const state = this.getGroup(groupJid);
     if (!state.active || !state.groupFolder) return;
 
-    const inputDir = path.join(DATA_DIR, 'ipc', state.groupFolder, 'input');
+    const ipcDir = state.ipcFolder ?? state.groupFolder;
+    const inputDir = path.join(DATA_DIR, 'ipc', ipcDir, 'input');
     try {
       fs.mkdirSync(inputDir, { recursive: true });
       fs.writeFileSync(path.join(inputDir, '_close'), '');

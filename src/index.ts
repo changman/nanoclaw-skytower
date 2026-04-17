@@ -5,6 +5,7 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import {
   ASSISTANT_NAME,
+  DATA_DIR,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
@@ -33,6 +34,7 @@ import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  deleteRegisteredGroup,
   deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
@@ -157,8 +159,13 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
-  // Create group folder
+  // Create group folder and persistent volume directories
   fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+  // Pre-create sessions directory so the volume mount target exists even
+  // before the container's first run, preventing data loss on early restarts.
+  fs.mkdirSync(path.join(DATA_DIR, 'sessions', group.folder, '.claude'), {
+    recursive: true,
+  });
 
   // Copy CLAUDE.md template into the new group folder so agents have
   // identity and instructions from the first run.  (Fixes #1391)
@@ -187,6 +194,16 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     { jid, name: group.name, folder: group.folder },
     'Group registered',
   );
+}
+
+function unregisterGroup(jid: string): void {
+  const deleted = deleteRegisteredGroup(jid);
+  if (deleted) {
+    delete registeredGroups[jid];
+    logger.info({ jid }, 'Group unregistered');
+  } else {
+    logger.warn({ jid }, 'Group not found for unregistration');
+  }
 }
 
 /**
@@ -283,32 +300,48 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  // Build thinking callback: stream individual chunks if channel supports it.
+  const thinkingCallback = channel.sendThinkingChunk
+    ? (text: string) => {
+        channel.sendThinkingChunk!(chatJid, text);
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
+    : undefined;
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+  const ipcFolderSuffix = channel.getIpcFolderSuffix?.(chatJid);
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+  const output = await runAgent(
+    group,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
+      }
+
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
+
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+    thinkingCallback,
+    ipcFolderSuffix,
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -341,14 +374,21 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onThinkingChunk?: (text: string) => void,
+  ipcFolderSuffix?: string,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  // Channels can return an ipcFolderSuffix to create per-JID sub-folders for
+  // isolation (e.g. separate Claude sessions per conversation).
+  const ipcFolder = ipcFolderSuffix
+    ? `${group.folder}__${ipcFolderSuffix}`
+    : group.folder;
+  const sessionId = sessions[ipcFolder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
   writeTasksSnapshot(
-    group.folder,
+    ipcFolder,
     isMain,
     tasks.map((t) => ({
       id: t.id,
@@ -365,7 +405,7 @@ async function runAgent(
   // Update available groups snapshot (main group only can see all groups)
   const availableGroups = getAvailableGroups();
   writeGroupsSnapshot(
-    group.folder,
+    ipcFolder,
     isMain,
     availableGroups,
     new Set(Object.keys(registeredGroups)),
@@ -375,8 +415,8 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions[ipcFolder] = output.newSessionId;
+          setSession(ipcFolder, output.newSessionId);
         }
         await onOutput(output);
       }
@@ -389,18 +429,20 @@ async function runAgent(
         prompt,
         sessionId,
         groupFolder: group.folder,
+        ipcFolder,
         chatJid,
         isMain,
         assistantName: ASSISTANT_NAME,
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(chatJid, proc, containerName, group.folder, ipcFolder),
       wrappedOnOutput,
+      onThinkingChunk,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions[ipcFolder] = output.newSessionId;
+      setSession(ipcFolder, output.newSessionId);
     }
 
     if (output.status === 'error') {
@@ -420,8 +462,8 @@ async function runAgent(
           { group: group.name, staleSessionId: sessionId, error: output.error },
           'Stale session detected — clearing for next retry',
         );
-        delete sessions[group.folder];
-        deleteSession(group.folder);
+        delete sessions[ipcFolder];
+        deleteSession(ipcFolder);
       }
 
       logger.error(
@@ -574,9 +616,21 @@ async function main(): Promise<void> {
   logger.info('Database initialized');
   loadState();
 
-  // Ensure OneCLI agents exist for all registered groups.
-  // Recovers from missed creates (e.g. OneCLI was down at registration time).
+  // Ensure directories and OneCLI agents exist for all registered groups.
+  // Recovers from missed creates (e.g. first boot after DB migration, OneCLI down).
   for (const [jid, group] of Object.entries(registeredGroups)) {
+    try {
+      const groupDir = resolveGroupFolderPath(group.folder);
+      fs.mkdirSync(path.join(groupDir, 'logs'), { recursive: true });
+      fs.mkdirSync(path.join(DATA_DIR, 'sessions', group.folder, '.claude'), {
+        recursive: true,
+      });
+    } catch (err) {
+      logger.warn(
+        { jid, folder: group.folder, err },
+        'Failed to ensure group directories',
+      );
+    }
     ensureOneCLIAgent(jid, group);
   }
 
@@ -672,6 +726,47 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onAutoRegister: (newJid: string, sourceJid: string) => {
+      if (registeredGroups[newJid]) return;
+      const source = registeredGroups[sourceJid];
+      if (!source) return;
+      // Memory-only: do NOT persist to DB — a channel's derived JIDs may share
+      // the same folder as the parent, which would violate the UNIQUE constraint.
+      // The mapping is re-created on the first message after restart.
+      const newGroup: RegisteredGroup = { ...source, requiresTrigger: false };
+      registeredGroups[newJid] = newGroup;
+      logger.info(
+        { newJid, sourceJid, folder: source.folder },
+        'Auto-registered derived JID (memory-only)',
+      );
+    },
+    onAutoRegisterNew: (
+      jid: string,
+      name: string,
+      folder: string,
+      isMain?: boolean,
+    ) => {
+      if (registeredGroups[jid]) return;
+      registerGroup(jid, {
+        name,
+        folder,
+        trigger: DEFAULT_TRIGGER,
+        added_at: new Date().toISOString(),
+        requiresTrigger: false,
+        isMain: isMain ?? false,
+      });
+    },
+    onPromoteToMain: (jid: string) => {
+      const group = registeredGroups[jid];
+      if (!group || group.isMain) return;
+      const updated = { ...group, isMain: true };
+      registeredGroups[jid] = updated;
+      setRegisteredGroup(jid, updated);
+      logger.info({ jid }, 'Group promoted to isMain=true by channel');
+    },
+    onAutoUnregister: (jid: string) => {
+      unregisterGroup(jid);
+    },
   };
 
   // Create and connect all registered channels.
@@ -679,16 +774,20 @@ async function main(): Promise<void> {
   // Factories return null when credentials are missing, so unconfigured channels are skipped.
   for (const channelName of getRegisteredChannelNames()) {
     const factory = getChannelFactory(channelName)!;
-    const channel = factory(channelOpts);
-    if (!channel) {
+    const result = factory(channelOpts);
+    if (!result) {
       logger.warn(
         { channel: channelName },
         'Channel installed but credentials missing — skipping. Check .env or re-run the channel skill.',
       );
       continue;
     }
-    channels.push(channel);
-    await channel.connect();
+    // Factories may return a single Channel or an array (e.g. multiple relay instances).
+    const channelList = Array.isArray(result) ? result : [result];
+    for (const channel of channelList) {
+      channels.push(channel);
+      await channel.connect();
+    }
   }
   if (channels.length === 0) {
     logger.fatal('No channels connected');
@@ -720,6 +819,7 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
+    unregisterGroup,
     syncGroups: async (force: boolean) => {
       await Promise.all(
         channels
@@ -742,8 +842,29 @@ async function main(): Promise<void> {
         status: t.status,
         next_run: t.next_run,
       }));
+      // Build folder→isMain lookup from registered groups
+      const folderIsMain = new Map<string, boolean>();
       for (const group of Object.values(registeredGroups)) {
-        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+        folderIsMain.set(group.folder, group.isMain === true);
+      }
+      // Also update any per-JID IPC sub-dirs created by channels (e.g. `folder__suffix`).
+      // These share the same isMain status as their base folder.
+      const ipcBaseDir = path.join(DATA_DIR, 'ipc');
+      const ipcDirs = fs.existsSync(ipcBaseDir)
+        ? fs
+            .readdirSync(ipcBaseDir)
+            .filter((d) =>
+              fs.statSync(path.join(ipcBaseDir, d)).isDirectory(),
+            )
+        : [];
+      for (const dir of ipcDirs) {
+        const baseFolder = dir.includes('__') ? dir.split('__')[0] : dir;
+        const isMain =
+          folderIsMain.get(dir) === true ||
+          folderIsMain.get(baseFolder) === true;
+        if (folderIsMain.has(dir) || folderIsMain.has(baseFolder)) {
+          writeTasksSnapshot(dir, isMain, taskRows);
+        }
       }
     },
   });
