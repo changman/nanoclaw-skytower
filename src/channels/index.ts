@@ -9,4 +9,7 @@
 
 // telegram
 
+// relay
+import './relay.js';
+
 // whatsapp

@@ -13,6 +13,10 @@ import {
   MAX_MESSAGES_PER_PROMPT,
   ONECLI_URL,
   POLL_INTERVAL,
+  RELAY_AGENT_ID,
+  RELAY_AGENT_TOKEN,
+  RELAY_CHANNELS,
+  RELAY_URL,
   TIMEZONE,
 } from './config.js';
 import './channels/index.js';
@@ -23,6 +27,7 @@ import {
 import {
   ContainerOutput,
   runContainerAgent,
+  startRelayContainer,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -637,14 +642,50 @@ async function main(): Promise<void> {
   restoreRemoteControl();
 
   // Graceful shutdown handlers
+  let relayStop: (() => void) | null = null;
+  let relayStopped = false;
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    relayStopped = true;
+    relayStop?.();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+
+  // Start legacy relay container if RELAY_URL is configured but not RELAY_CHANNELS.
+  // When RELAY_CHANNELS is set, the RelayChannel handles connectivity instead.
+  if (RELAY_URL && RELAY_AGENT_TOKEN && !RELAY_CHANNELS) {
+    const mainGroup = Object.values(registeredGroups).find((g) => g.isMain);
+    if (mainGroup) {
+      const launchRelay = () => {
+        startRelayContainer(
+          mainGroup,
+          {
+            relayUrl: RELAY_URL,
+            agentId: RELAY_AGENT_ID,
+            agentToken: RELAY_AGENT_TOKEN,
+            agentName: ASSISTANT_NAME,
+          },
+          (code) => {
+            if (!relayStopped) {
+              logger.warn({ code }, 'Relay container exited, restarting in 5s');
+              setTimeout(launchRelay, 5000);
+            }
+          },
+        ).then((stopFn) => {
+          relayStop = stopFn;
+        });
+      };
+      launchRelay();
+    } else {
+      logger.warn(
+        'RELAY_URL configured but no main group registered — relay not started',
+      );
+    }
+  }
 
   // Handle /remote-control and /remote-control-end commands
   async function handleRemoteControl(

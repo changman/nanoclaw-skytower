@@ -11,6 +11,10 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
+  'RELAY_URL',
+  'AGENT_ID',
+  'AGENT_TOKEN',
+  'RELAY_CHANNELS',
 ]);
 
 export const ASSISTANT_NAME =
@@ -97,3 +101,14 @@ function resolveConfigTimezone(): string {
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
+
+// Relay agent config — optional web UI connectivity via relay server
+export const RELAY_URL = process.env.RELAY_URL || envConfig.RELAY_URL || '';
+export const RELAY_AGENT_ID = process.env.AGENT_ID || envConfig.AGENT_ID || '';
+export const RELAY_AGENT_TOKEN =
+  process.env.AGENT_TOKEN || envConfig.AGENT_TOKEN || '';
+
+// RelayChannel multi-instance config (JSON array string).
+// When set, RelayChannel handles connections; legacy startRelayContainer() is skipped.
+export const RELAY_CHANNELS =
+  process.env.RELAY_CHANNELS || envConfig.RELAY_CHANNELS || '';
