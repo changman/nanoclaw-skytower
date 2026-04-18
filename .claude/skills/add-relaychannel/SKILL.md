@@ -67,17 +67,46 @@ Build must be clean before proceeding.
 
 ## Phase 3: Setup
 
-### Collect relay server information
+### Step 1: Register agent and get token
 
-Ask the user for their relay server details:
+Ask the user for the relay server URL (default: `https://skytower.onrender.com`).
 
-> I need the relay server connection info. Please provide:
->
-> 1. **Relay server URL** (e.g. `https://relay.example.com`)
-> 2. **Agent ID** — the agent ID registered on the relay server
-> 3. **Token** — authentication token in `agentId:rawToken` format
+Register the agent and get `agentId` + `token`:
 
-Wait for the user to provide these values.
+```bash
+curl -s -X POST "<relay-url>/api/agents/register" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "My Agent"}'
+```
+
+Response:
+```json
+{ "agentId": "ePm9vhUooJx9", "token": "ePm9vhUooJx9:XfnvBCPP..." }
+```
+
+Save the `agentId` and `token` — these are needed for the next steps and for `.env` configuration.
+
+### Step 2: Generate pairing code
+
+Use the token from Step 1 to generate a pairing code for the web UI:
+
+```bash
+curl -s -X POST "<relay-url>/api/agents/pairing-code" \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"maxUses": 1, "expiresMinutes": 10}'
+```
+
+Response:
+```json
+{
+  "code": "ABC123",
+  "pairUrl": "<relay-url>/pair/ABC123",
+  "expiresAt": "..."
+}
+```
+
+Share the `pairUrl` with the user so they can connect via the web UI. The pairing code expires in 10 minutes — regenerate if needed.
 
 ### Single instance vs. multiple instances
 
